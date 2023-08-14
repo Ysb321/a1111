@@ -92,7 +92,15 @@ def images_tensor_to_samples(image, approximation=None, model=None):
             model = shared.sd_model
         image = image.to(shared.device, dtype=devices.dtype_vae)
         image = image * 2 - 1
-        x_latent = model.get_first_stage_encoding(model.encode_first_stage(image))
+        if len(image) > 1:
+            x_latent = torch.stack([
+                model.get_first_stage_encoding(
+                    model.encode_first_stage(torch.unsqueeze(img, 0))
+                )[0]
+                for img in image
+            ])
+        else:
+            x_latent = model.get_first_stage_encoding(model.encode_first_stage(image))
 
     return x_latent
 
@@ -276,19 +284,19 @@ class Sampler:
             s_tmax = getattr(opts, 's_tmax', p.s_tmax) or self.s_tmax # 0 = inf
             s_noise = getattr(opts, 's_noise', p.s_noise)
 
-            if s_churn != self.s_churn:
+            if 's_churn' in extra_params_kwargs and s_churn != self.s_churn:
                 extra_params_kwargs['s_churn'] = s_churn
                 p.s_churn = s_churn
                 p.extra_generation_params['Sigma churn'] = s_churn
-            if s_tmin != self.s_tmin:
+            if 's_tmin' in extra_params_kwargs and s_tmin != self.s_tmin:
                 extra_params_kwargs['s_tmin'] = s_tmin
                 p.s_tmin = s_tmin
                 p.extra_generation_params['Sigma tmin'] = s_tmin
-            if s_tmax != self.s_tmax:
+            if 's_tmax' in extra_params_kwargs and s_tmax != self.s_tmax:
                 extra_params_kwargs['s_tmax'] = s_tmax
                 p.s_tmax = s_tmax
                 p.extra_generation_params['Sigma tmax'] = s_tmax
-            if s_noise != self.s_noise:
+            if 's_noise' in extra_params_kwargs and s_noise != self.s_noise:
                 extra_params_kwargs['s_noise'] = s_noise
                 p.s_noise = s_noise
                 p.extra_generation_params['Sigma noise'] = s_noise

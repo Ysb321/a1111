@@ -152,11 +152,14 @@ class StableDiffusionProcessing:
     token_merging_ratio_hr = 0
     disable_extra_networks: bool = False
 
-    script_args: list = None
+    scripts_value: scripts.ScriptRunner = field(default=None, init=False)
+    script_args_value: list = field(default=None, init=False)
+    scripts_setup_complete: bool = field(default=False, init=False)
 
     cached_uc = [None, None]
     cached_c = [None, None]
 
+    comments: dict = None
     sampler: sd_samplers_common.Sampler | None = field(default=None, init=False)
     is_using_inpainting_conditioning: bool = field(default=False, init=False)
     paste_to: tuple | None = field(default=None, init=False)
@@ -170,7 +173,6 @@ class StableDiffusionProcessing:
     step_multiplier: int = field(default=1, init=False)
     color_corrections: list = field(default=None, init=False)
 
-    scripts: list = field(default=None, init=False)
     all_prompts: list = field(default=None, init=False)
     all_negative_prompts: list = field(default=None, init=False)
     all_seeds: list = field(default=None, init=False)
@@ -195,6 +197,8 @@ class StableDiffusionProcessing:
     def __post_init__(self):
         if self.sampler_index is not None:
             print("sampler_index argument for StableDiffusionProcessing does not do anything; use sampler_name", file=sys.stderr)
+
+        self.comments = {}
 
         self.sampler_noise_scheduler_override = None
         self.s_min_uncond = self.s_min_uncond if self.s_min_uncond is not None else opts.s_min_uncond
@@ -225,6 +229,36 @@ class StableDiffusionProcessing:
     @sd_model.setter
     def sd_model(self, value):
         pass
+
+    @property
+    def scripts(self):
+        return self.scripts_value
+
+    @scripts.setter
+    def scripts(self, value):
+        self.scripts_value = value
+
+        if self.scripts_value and self.script_args_value and not self.scripts_setup_complete:
+            self.setup_scripts()
+
+    @property
+    def script_args(self):
+        return self.script_args_value
+
+    @script_args.setter
+    def script_args(self, value):
+        self.script_args_value = value
+
+        if self.scripts_value and self.script_args_value and not self.scripts_setup_complete:
+            self.setup_scripts()
+
+    def setup_scripts(self):
+        self.scripts_setup_complete = True
+
+        self.scripts.setup_scrips(self)
+
+    def comment(self, text):
+        self.comments[text] = 1
 
     def txt2img_image_conditioning(self, x, width=None, height=None):
         self.is_using_inpainting_conditioning = self.sd_model.model.conditioning_key in {'hybrid', 'concat'}
@@ -429,7 +463,7 @@ class Processed:
         self.subseed = subseed
         self.subseed_strength = p.subseed_strength
         self.info = info
-        self.comments = comments
+        self.comments = "".join(f"{comment}\n" for comment in p.comments)
         self.width = p.width
         self.height = p.height
         self.sampler_name = p.sampler_name
@@ -720,8 +754,6 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     modules.sd_hijack.model_hijack.apply_circular(p.tiling)
     modules.sd_hijack.model_hijack.clear_comments()
 
-    comments = {}
-
     p.setup_prompts()
 
     if type(seed) == list:
@@ -801,7 +833,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             p.setup_conds()
 
             for comment in model_hijack.comments:
-                comments[comment] = 1
+                p.comment(comment)
 
             p.extra_generation_params.update(model_hijack.extra_generation_params)
 
@@ -930,7 +962,6 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         images_list=output_images,
         seed=p.all_seeds[0],
         info=infotexts[0],
-        comments="".join(f"{comment}\n" for comment in comments),
         subseed=p.all_subseeds[0],
         index_of_first_image=index_of_first_image,
         infotexts=infotexts,
@@ -1191,6 +1222,9 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         samples = self.sampler.sample_img2img(self, samples, noise, self.hr_c, self.hr_uc, steps=self.hr_second_pass_steps or self.steps, image_conditioning=image_conditioning)
 
         sd_models.apply_token_merging(self.sd_model, self.get_token_merging_ratio())
+
+        self.sampler = None
+        devices.torch_gc()
 
         decoded_samples = decode_latent_batch(self.sd_model, samples, target_device=devices.cpu, check_for_nans=True)
 
