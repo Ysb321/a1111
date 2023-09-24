@@ -269,7 +269,7 @@ class Script:
         """helper function to generate id for a HTML element, constructs final id out of script name, tab and user-supplied item_id"""
 
         need_tabname = self.show(True) == self.show(False)
-        tabkind = 'img2img' if self.is_img2img else 'txt2txt'
+        tabkind = 'img2img' if self.is_img2img else 'txt2img'
         tabname = f"{tabkind}_" if need_tabname else ""
         title = re.sub(r'[^a-z_0-9]', '', re.sub(r'\s', '_', self.title().lower()))
 
@@ -289,7 +289,7 @@ class ScriptBuiltinUI(Script):
         """helper function to generate id for a HTML element, constructs final id out of tab and user-supplied item_id"""
 
         need_tabname = self.show(True) == self.show(False)
-        tabname = ('img2img' if self.is_img2img else 'txt2txt') + "_" if need_tabname else ""
+        tabname = ('img2img' if self.is_img2img else 'txt2img') + "_" if need_tabname else ""
 
         return f'{tabname}{item_id}'
 
@@ -491,10 +491,14 @@ class ScriptRunner:
 
             arg_info = api_models.ScriptArg(label=control.label or "")
 
-            for field in ("value", "minimum", "maximum", "step", "choices"):
+            for field in ("value", "minimum", "maximum", "step"):
                 v = getattr(control, field, None)
                 if v is not None:
                     setattr(arg_info, field, v)
+
+            choices = getattr(control, 'choices', None)  # as of gradio 3.41, some items in choices are strings, and some are tuples where the first elem is the string
+            if choices is not None:
+                arg_info.choices = [x[0] if isinstance(x, tuple) else x for x in choices]
 
             api_args.append(arg_info)
 

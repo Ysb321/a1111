@@ -91,8 +91,8 @@ def create_binary_mask(image):
 def txt2img_image_conditioning(sd_model, x, width, height):
     if sd_model.model.conditioning_key in {'hybrid', 'concat'}: # Inpainting models
 
-        # The "masked-image" in this case will just be all zeros since the entire image is masked.
-        image_conditioning = torch.zeros(x.shape[0], 3, height, width, device=x.device)
+        # The "masked-image" in this case will just be all 0.5 since the entire image is masked.
+        image_conditioning = torch.ones(x.shape[0], 3, height, width, device=x.device) * 0.5
         image_conditioning = images_tensor_to_samples(image_conditioning, approximation_indexes.get(opts.sd_vae_encode_method))
 
         # Add the fake full 1s mask to the first dimension.
@@ -386,14 +386,14 @@ class StableDiffusionProcessing:
         return self.token_merging_ratio or opts.token_merging_ratio
 
     def setup_prompts(self):
-        if type(self.prompt) == list:
+        if isinstance(self.prompt,list):
             self.all_prompts = self.prompt
-        elif type(self.negative_prompt) == list:
+        elif isinstance(self.negative_prompt, list):
             self.all_prompts = [self.prompt] * len(self.negative_prompt)
         else:
             self.all_prompts = self.batch_size * self.n_iter * [self.prompt]
 
-        if type(self.negative_prompt) == list:
+        if isinstance(self.negative_prompt, list):
             self.all_negative_prompts = self.negative_prompt
         else:
             self.all_negative_prompts = [self.negative_prompt] * len(self.all_prompts)
@@ -407,12 +407,14 @@ class StableDiffusionProcessing:
         self.main_prompt = self.all_prompts[0]
         self.main_negative_prompt = self.all_negative_prompts[0]
 
-    def cached_params(self, required_prompts, steps, extra_network_data):
+    def cached_params(self, required_prompts, steps, extra_network_data, hires_steps=None, use_old_scheduling=False):
         """Returns parameters that invalidate the cond cache if changed"""
 
         return (
             required_prompts,
             steps,
+            hires_steps,
+            use_old_scheduling,
             opts.CLIP_stop_at_last_layers,
             shared.sd_model.sd_checkpoint_info,
             extra_network_data,
@@ -422,7 +424,7 @@ class StableDiffusionProcessing:
             self.height,
         )
 
-    def get_conds_with_caching(self, function, required_prompts, steps, caches, extra_network_data):
+    def get_conds_with_caching(self, function, required_prompts, steps, caches, extra_network_data, hires_steps=None):
         """
         Returns the result of calling function(shared.sd_model, required_prompts, steps)
         using a cache to store the result if the same arguments have been used before.
@@ -435,7 +437,13 @@ class StableDiffusionProcessing:
         caches is a list with items described above.
         """
 
-        cached_params = self.cached_params(required_prompts, steps, extra_network_data)
+        if shared.opts.use_old_scheduling:
+            old_schedules = prompt_parser.get_learned_conditioning_prompt_schedules(required_prompts, steps, hires_steps, False)
+            new_schedules = prompt_parser.get_learned_conditioning_prompt_schedules(required_prompts, steps, hires_steps, True)
+            if old_schedules != new_schedules:
+                self.extra_generation_params["Old prompt editing timelines"] = True
+
+        cached_params = self.cached_params(required_prompts, steps, extra_network_data, hires_steps, shared.opts.use_old_scheduling)
 
         for cache in caches:
             if cache[0] is not None and cached_params == cache[0]:
@@ -444,7 +452,7 @@ class StableDiffusionProcessing:
         cache = caches[0]
 
         with devices.autocast():
-            cache[1] = function(shared.sd_model, required_prompts, steps)
+            cache[1] = function(shared.sd_model, required_prompts, steps, hires_steps, shared.opts.use_old_scheduling)
 
         cache[0] = cached_params
         return cache[1]
@@ -456,6 +464,8 @@ class StableDiffusionProcessing:
         sampler_config = sd_samplers.find_sampler_config(self.sampler_name)
         total_steps = sampler_config.total_steps(self.steps) if sampler_config else self.steps
         self.step_multiplier = total_steps // self.steps
+        self.firstpass_steps = total_steps
+
         self.uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, negative_prompts, total_steps, [self.cached_uc], self.extra_network_data)
         self.c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, prompts, total_steps, [self.cached_c], self.extra_network_data)
 
@@ -512,10 +522,10 @@ class Processed:
         self.s_noise = p.s_noise
         self.s_min_uncond = p.s_min_uncond
         self.sampler_noise_scheduler_override = p.sampler_noise_scheduler_override
-        self.prompt = self.prompt if type(self.prompt) != list else self.prompt[0]
-        self.negative_prompt = self.negative_prompt if type(self.negative_prompt) != list else self.negative_prompt[0]
-        self.seed = int(self.seed if type(self.seed) != list else self.seed[0]) if self.seed is not None else -1
-        self.subseed = int(self.subseed if type(self.subseed) != list else self.subseed[0]) if self.subseed is not None else -1
+        self.prompt = self.prompt if not isinstance(self.prompt, list) else self.prompt[0]
+        self.negative_prompt = self.negative_prompt if not isinstance(self.negative_prompt, list) else self.negative_prompt[0]
+        self.seed = int(self.seed if not isinstance(self.seed, list) else self.seed[0]) if self.seed is not None else -1
+        self.subseed = int(self.subseed if not isinstance(self.subseed, list) else self.subseed[0]) if self.subseed is not None else -1
         self.is_using_inpainting_conditioning = p.is_using_inpainting_conditioning
 
         self.all_prompts = all_prompts or p.all_prompts or [self.prompt]
@@ -523,6 +533,7 @@ class Processed:
         self.all_seeds = all_seeds or p.all_seeds or [self.seed]
         self.all_subseeds = all_subseeds or p.all_subseeds or [self.subseed]
         self.infotexts = infotexts or [info]
+        self.version = program_version()
 
     def js(self):
         obj = {
@@ -557,6 +568,7 @@ class Processed:
             "job_timestamp": self.job_timestamp,
             "clip_skip": self.clip_skip,
             "is_using_inpainting_conditioning": self.is_using_inpainting_conditioning,
+            "version": self.version,
         }
 
         return json.dumps(obj)
@@ -679,7 +691,7 @@ def create_infotext(p, all_prompts, all_seeds, all_subseeds, comments=None, iter
         "Token merging ratio": None if token_merging_ratio == 0 else token_merging_ratio,
         "Token merging ratio hr": None if not enable_hr or token_merging_ratio_hr == 0 else token_merging_ratio_hr,
         "Init image hash": getattr(p, 'init_img_hash', None),
-        "RNG": opts.randn_source if opts.randn_source != "GPU" and opts.randn_source != "NV" else None,
+        "RNG": opts.randn_source if opts.randn_source != "GPU" else None,
         "NGMS": None if p.s_min_uncond == 0 else p.s_min_uncond,
         "Tiling": "True" if p.tiling else None,
         **p.extra_generation_params,
@@ -702,17 +714,14 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     stored_opts = {k: opts.data[k] for k in p.override_settings.keys()}
 
     try:
-        # after running refiner, the refiner model is not unloaded - webui swaps back to main model here
-        if shared.sd_model.sd_checkpoint_info.title != opts.sd_model_checkpoint:
-            sd_models.reload_model_weights()
-
         # if no checkpoint override or the override checkpoint can't be found, remove override entry and load opts checkpoint
+        # and if after running refiner, the refiner model is not unloaded - webui swaps back to main model here, if model over is present it will be reloaded afterwards
         if sd_models.checkpoint_aliases.get(p.override_settings.get('sd_model_checkpoint')) is None:
             p.override_settings.pop('sd_model_checkpoint', None)
             sd_models.reload_model_weights()
 
         for k, v in p.override_settings.items():
-            setattr(opts, k, v)
+            opts.set(k, v, is_api=True, run_callbacks=False)
 
             if k == 'sd_model_checkpoint':
                 sd_models.reload_model_weights()
@@ -741,7 +750,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
 
-    if type(p.prompt) == list:
+    if isinstance(p.prompt, list):
         assert(len(p.prompt) > 0)
     else:
         assert p.prompt is not None
@@ -772,12 +781,12 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
     p.setup_prompts()
 
-    if type(seed) == list:
+    if isinstance(seed, list):
         p.all_seeds = seed
     else:
         p.all_seeds = [int(seed) + (x if p.subseed_strength == 0 else 0) for x in range(len(p.all_prompts))]
 
-    if type(subseed) == list:
+    if isinstance(subseed, list):
         p.all_subseeds = subseed
     else:
         p.all_subseeds = [int(subseed) + x for x in range(len(p.all_prompts))]
@@ -1141,20 +1150,17 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         else:
             decoded_samples = None
 
-        current = shared.sd_model.sd_checkpoint_info
-        try:
-            if self.hr_checkpoint_info is not None:
-                self.sampler = None
-                sd_models.reload_model_weights(info=self.hr_checkpoint_info)
-                devices.torch_gc()
+        with sd_models.SkipWritingToConfig():
+            sd_models.reload_model_weights(info=self.hr_checkpoint_info)
 
-            return self.sample_hr_pass(samples, decoded_samples, seeds, subseeds, subseed_strength, prompts)
-        finally:
-            self.sampler = None
-            sd_models.reload_model_weights(info=current)
-            devices.torch_gc()
+        devices.torch_gc()
+
+        return self.sample_hr_pass(samples, decoded_samples, seeds, subseeds, subseed_strength, prompts)
 
     def sample_hr_pass(self, samples, decoded_samples, seeds, subseeds, subseed_strength, prompts):
+        if shared.state.interrupted:
+            return samples
+
         self.is_hr_pass = True
 
         target_width = self.hr_upscale_to_x
@@ -1268,12 +1274,12 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         if self.hr_negative_prompt == '':
             self.hr_negative_prompt = self.negative_prompt
 
-        if type(self.hr_prompt) == list:
+        if isinstance(self.hr_prompt, list):
             self.all_hr_prompts = self.hr_prompt
         else:
             self.all_hr_prompts = self.batch_size * self.n_iter * [self.hr_prompt]
 
-        if type(self.hr_negative_prompt) == list:
+        if isinstance(self.hr_negative_prompt, list):
             self.all_hr_negative_prompts = self.hr_negative_prompt
         else:
             self.all_hr_negative_prompts = self.batch_size * self.n_iter * [self.hr_negative_prompt]
@@ -1292,8 +1298,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         steps = self.hr_second_pass_steps or self.steps
         total_steps = sampler_config.total_steps(steps) if sampler_config else steps
 
-        self.hr_uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_negative_prompts, total_steps, [self.cached_hr_uc, self.cached_uc], self.hr_extra_network_data)
-        self.hr_c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, hr_prompts, total_steps, [self.cached_hr_c, self.cached_c], self.hr_extra_network_data)
+        self.hr_uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_negative_prompts, self.firstpass_steps, [self.cached_hr_uc, self.cached_uc], self.hr_extra_network_data, total_steps)
+        self.hr_c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, hr_prompts, self.firstpass_steps, [self.cached_hr_c, self.cached_c], self.hr_extra_network_data, total_steps)
 
     def setup_conds(self):
         if self.is_hr_pass:
@@ -1311,7 +1317,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             if shared.opts.hires_fix_use_firstpass_conds:
                 self.calculate_hr_conds()
 
-            elif lowvram.is_enabled(shared.sd_model):  # if in lowvram mode, we need to calculate conds right away, before the cond NN is unloaded
+            elif lowvram.is_enabled(shared.sd_model) and shared.sd_model.sd_checkpoint_info == sd_models.select_checkpoint():  # if in lowvram mode, we need to calculate conds right away, before the cond NN is unloaded
                 with devices.autocast():
                     extra_networks.activate(self, self.hr_extra_network_data)
 

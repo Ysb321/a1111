@@ -35,9 +35,14 @@ approximation_indexes = {"Full": 0, "Approx NN": 1, "Approx cheap": 2, "TAESD": 
 
 
 def samples_to_images_tensor(sample, approximation=None, model=None):
-    '''latents -> images [-1, 1]'''
-    if approximation is None:
+    """Transforms 4-channel latent space images into 3-channel RGB image tensors, with values in range [-1, 1]."""
+
+    if approximation is None or (shared.state.interrupted and opts.live_preview_fast_interrupt):
         approximation = approximation_indexes.get(opts.show_progress_type, 0)
+
+        from modules import lowvram
+        if approximation == 0 and lowvram.is_enabled(shared.sd_model) and not shared.opts.live_preview_allow_lowvram_full:
+            approximation = 1
 
     if approximation == 2:
         x_sample = sd_vae_approx.cheap_approximation(sample)
@@ -49,7 +54,8 @@ def samples_to_images_tensor(sample, approximation=None, model=None):
     else:
         if model is None:
             model = shared.sd_model
-        x_sample = model.decode_first_stage(sample.to(model.first_stage_model.dtype))
+        with devices.without_autocast(): # fixes an issue with unstable VAEs that are flaky even in fp32
+            x_sample = model.decode_first_stage(sample.to(model.first_stage_model.dtype))
 
     return x_sample
 
@@ -89,6 +95,8 @@ def images_tensor_to_samples(image, approximation=None, model=None):
     else:
         if model is None:
             model = shared.sd_model
+        model.first_stage_model.to(devices.dtype_vae)
+
         image = image.to(shared.device, dtype=devices.dtype_vae)
         image = image * 2 - 1
         if len(image) > 1:
@@ -158,8 +166,17 @@ def apply_refiner(cfg_denoiser):
     if refiner_checkpoint_info is None or shared.sd_model.sd_checkpoint_info == refiner_checkpoint_info:
         return False
 
-    if getattr(cfg_denoiser.p, "enable_hr", False) and not cfg_denoiser.p.is_hr_pass:
-        return False
+    if getattr(cfg_denoiser.p, "enable_hr", False):
+        is_second_pass = cfg_denoiser.p.is_hr_pass
+
+        if opts.hires_fix_refiner_pass == "first pass" and is_second_pass:
+            return False
+
+        if opts.hires_fix_refiner_pass == "second pass" and not is_second_pass:
+            return False
+
+        if opts.hires_fix_refiner_pass != "second pass":
+            cfg_denoiser.p.extra_generation_params['Hires refiner'] = opts.hires_fix_refiner_pass
 
     cfg_denoiser.p.extra_generation_params['Refiner'] = refiner_checkpoint_info.short_title
     cfg_denoiser.p.extra_generation_params['Refiner switch at'] = refiner_switch_at

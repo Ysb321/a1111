@@ -2,7 +2,7 @@ import torch
 from torch.nn.functional import silu
 from types import MethodType
 
-from modules import devices, sd_hijack_optimizations, shared, script_callbacks, errors, sd_unet
+from modules import devices, sd_hijack_optimizations, shared, script_callbacks, errors, sd_unet, patches
 from modules.hypernetworks import hypernetwork
 from modules.shared import cmd_opts
 from modules import sd_hijack_clip, sd_hijack_open_clip, sd_hijack_unet, sd_hijack_xlmr, xlmr
@@ -10,6 +10,7 @@ from modules import sd_hijack_clip, sd_hijack_open_clip, sd_hijack_unet, sd_hija
 import ldm.modules.attention
 import ldm.modules.diffusionmodules.model
 import ldm.modules.diffusionmodules.openaimodel
+import ldm.models.diffusion.ddpm
 import ldm.models.diffusion.ddim
 import ldm.models.diffusion.plms
 import ldm.modules.encoders.modules
@@ -37,6 +38,8 @@ ldm.models.diffusion.ddpm.print = shared.ldm_print
 optimizers = []
 current_optimizer: sd_hijack_optimizations.SdOptimization = None
 
+ldm_original_forward = patches.patch(__file__, ldm.modules.diffusionmodules.openaimodel.UNetModel, "forward", sd_unet.UNetModel_forward)
+sgm_original_forward = patches.patch(__file__, sgm.modules.diffusionmodules.openaimodel.UNetModel, "forward", sd_unet.UNetModel_forward)
 
 def list_optimizers():
     new_optimizers = script_callbacks.list_optimizers_callback()
@@ -239,13 +242,30 @@ class StableDiffusionModelHijack:
 
         self.layers = flatten(m)
 
-        if not hasattr(ldm.modules.diffusionmodules.openaimodel, 'copy_of_UNetModel_forward_for_webui'):
-            ldm.modules.diffusionmodules.openaimodel.copy_of_UNetModel_forward_for_webui = ldm.modules.diffusionmodules.openaimodel.UNetModel.forward
+        if isinstance(m, ldm.models.diffusion.ddpm.LatentDiffusion):
+            sd_unet.original_forward = ldm_original_forward
+        elif isinstance(m, sgm.models.diffusion.DiffusionEngine):
+            sd_unet.original_forward = sgm_original_forward
+        else:
+            sd_unet.original_forward = None
 
-        ldm.modules.diffusionmodules.openaimodel.UNetModel.forward = sd_unet.UNetModel_forward
 
     def undo_hijack(self, m):
-        if type(m.cond_stage_model) == sd_hijack_xlmr.FrozenXLMREmbedderWithCustomWords:
+        conditioner = getattr(m, 'conditioner', None)
+        if conditioner:
+            for i in range(len(conditioner.embedders)):
+                embedder = conditioner.embedders[i]
+                if isinstance(embedder, (sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords, sd_hijack_open_clip.FrozenOpenCLIPEmbedder2WithCustomWords)):
+                    embedder.wrapped.model.token_embedding = embedder.wrapped.model.token_embedding.wrapped
+                    conditioner.embedders[i] = embedder.wrapped
+                if isinstance(embedder, sd_hijack_clip.FrozenCLIPEmbedderForSDXLWithCustomWords):
+                    embedder.wrapped.transformer.text_model.embeddings.token_embedding = embedder.wrapped.transformer.text_model.embeddings.token_embedding.wrapped
+                    conditioner.embedders[i] = embedder.wrapped
+
+            if hasattr(m, 'cond_stage_model'):
+                delattr(m, 'cond_stage_model')
+
+        elif type(m.cond_stage_model) == sd_hijack_xlmr.FrozenXLMREmbedderWithCustomWords:
             m.cond_stage_model = m.cond_stage_model.wrapped
 
         elif type(m.cond_stage_model) == sd_hijack_clip.FrozenCLIPEmbedderWithCustomWords:
@@ -265,7 +285,8 @@ class StableDiffusionModelHijack:
         self.layers = None
         self.clip = None
 
-        ldm.modules.diffusionmodules.openaimodel.UNetModel.forward = ldm.modules.diffusionmodules.openaimodel.copy_of_UNetModel_forward_for_webui
+        sd_unet.original_forward = None
+
 
     def apply_circular(self, enable):
         if self.circular_enabled == enable:
